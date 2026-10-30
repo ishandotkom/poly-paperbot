@@ -8,7 +8,8 @@ live order book (at the signal and DELAYS seconds later), then logs the result o
 resolves. Signals use the same rule as lag_test.py.
 Run: python paper_bot.py               (runs until Ctrl+C)
      python paper_bot.py --minutes 60  (stops after an hour, then waits for pending results)
-Results append to paper_trades.csv.
+     python paper_bot.py --port 8000   (also serves the dashboard at http://localhost:8000)
+Results append to paper_trades.csv. On Render the dashboard is served on $PORT automatically.
 """
 
 import argparse
@@ -18,6 +19,7 @@ import os
 import threading
 import time
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
 import websocket
@@ -32,6 +34,7 @@ SIZE_USD       = bt.SIZE_USD    # dollars per paper trade
 DELAYS         = [0, 1, 2, 3]   # also price the same order this many seconds after the signal
 MAX_BOOK_AGE   = 2              # seconds; order-book data older than this (by exchange time) is not counted
 LOG_FILE       = "paper_trades.csv"
+KEEP_ALIVE_MIN = 10             # on Render, ping our own public URL this often so a free instance doesn't sleep
 
 BINANCE_WS     = "wss://stream.binance.com:9443/ws/btcusdt@kline_1s"
 POLY_WS        = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -192,6 +195,8 @@ class PaperBot:
         self.csv_lock = threading.Lock()
         self.resolvers = []
         self.results = []
+        self.pending = {}     # slug -> signal still waiting for its market to resolve
+        self.started = time.time()
         if os.path.exists(LOG_FILE):
             with open(LOG_FILE, newline="") as f:
                 self.results = list(csv.DictReader(f))
@@ -246,6 +251,8 @@ class PaperBot:
         age = f"{f0['age']:.1f}s" if f0["age"] is not None else "none"
         log(f"{w.slug}: BTC {sig['move_pct']:+.3f}% at +{sig['sec_into_window']}s -> {sig['side']} | "
             f"bid/ask {f0['best_bid']}/{f0['best_ask']} (book age {age}) | avg fill {fills} | {sig['status'].upper()}")
+        with self.csv_lock:
+            self.pending[w.slug] = sig
 
     def resolve_later(self, w):
         def run():
@@ -258,6 +265,8 @@ class PaperBot:
                     return
                 time.sleep(30)
             log(f"{w.slug}: no result after 30 min, not recorded")
+            with self.csv_lock:
+                self.pending.pop(w.slug, None)
         t = threading.Thread(target=run, daemon=True)
         t.start()
         self.resolvers.append(t)
@@ -282,6 +291,7 @@ class PaperBot:
                     wr.writeheader()
                 wr.writerow(row)
             self.results.append(row)
+            self.pending.pop(w.slug, None)
         result = f"${row['pnl_0s']:+.2f}" if row["pnl_0s"] != "" else f"not traded ({sig['status']})"
         log(f"{w.slug}: {winner} won, {sig['side']} {'WIN' if won else 'LOSS'} -> {result}")
         log("TOTALS " + self.summary())
@@ -298,10 +308,101 @@ class PaperBot:
                 parts.append(f"+{d}s late {sum(pnls):+.2f} ({len(pnls)})")
         return " | ".join(parts)
 
+    def state(self):
+        """Everything the dashboard shows, as JSON-friendly values."""
+        with self.csv_lock:
+            rows = [dict(r) for r in self.results]
+            pending = list(self.pending.values())
+        trades = []
+        for r in rows:
+            t = {}
+            for k, v in r.items():
+                if k == "won":
+                    t[k] = v in (True, "True")
+                elif v in ("", None):
+                    t[k] = None
+                else:
+                    try:
+                        t[k] = float(v)
+                    except (TypeError, ValueError):
+                        t[k] = v
+            trades.append(t)
+        waiting = [{"slug": s["slug"], "signal_utc": s["signal_utc"], "sec_into_window": s["sec_into_window"],
+                    "move_pct": s["move_pct"], "side": s["side"], "status": s.get("status"),
+                    "best_bid": s["fills"][0]["best_bid"], "best_ask": s["fills"][0]["best_ask"],
+                    **{f"fill_{d}s": s["fills"][d]["avg"] if d in s["fills"] else None for d in DELAYS}}
+                   for s in pending]
+        w = self.window
+        return {"now": clock.now(), "started": self.started, "window": w.slug if w else None,
+                "binance_lag": self.feed.last_lag,
+                "settings": {"move_pct": MOVE_THRESHOLD * 100, "entry_end": ENTRY_END, "max_fill": MAX_FILL,
+                             "size_usd": SIZE_USD, "max_book_age": MAX_BOOK_AGE},
+                "trades": trades, "pending": waiting}
+
+# ================== WEB ==================
+def start_web(bot, port):
+    """Dashboard for the bot (Render web services set $PORT; locally use --port).
+    /           dashboard (dashboard.html)
+    /api/state  the data behind it, as JSON
+    /csv        download paper_trades.csv (a free Render instance loses its files on restart)"""
+    if not port:
+        return
+    page = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.html")
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            path = self.path.split("?")[0]
+            if path == "/api/state":
+                body = json.dumps(bot.state()).encode()
+                headers = {"Content-Type": "application/json", "Cache-Control": "no-store"}
+            elif path == "/csv" and os.path.exists(LOG_FILE):
+                with bot.csv_lock, open(LOG_FILE, "rb") as f:
+                    body = f.read()
+                headers = {"Content-Type": "text/csv",
+                           "Content-Disposition": f"attachment; filename={LOG_FILE}"}
+            elif path == "/" and os.path.exists(page):
+                with open(page, "rb") as f:
+                    body = f.read()
+                headers = {"Content-Type": "text/html; charset=utf-8"}
+            else:
+                body = (f"Paper bot running. No real orders are ever sent.\n\n{bot.summary()}\n\n"
+                        f"Results as CSV: /csv\n").encode()
+                headers = {"Content-Type": "text/plain; charset=utf-8"}
+            self.send_response(200)
+            for k, v in headers.items():
+                self.send_header(k, v)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_HEAD(self):
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("0.0.0.0", int(port)), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    log(f"Dashboard listening on port {port}")
+
+    url = os.environ.get("RENDER_EXTERNAL_URL")
+    if url:
+        def keep_alive():
+            while True:
+                time.sleep(KEEP_ALIVE_MIN * 60)
+                try:
+                    requests.get(url, timeout=30)
+                except Exception as e:
+                    log(f"Keep-alive ping failed: {e}")
+        threading.Thread(target=keep_alive, daemon=True).start()
+        log(f"Keep-alive: pinging {url} every {KEEP_ALIVE_MIN} min so the instance doesn't sleep")
+
 # ================== MAIN ==================
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--minutes", type=float, default=0, help="stop after this many minutes (0 = run until Ctrl+C)")
+    ap.add_argument("--port", type=int, default=None, help="serve the dashboard on this port (Render sets $PORT)")
     args = ap.parse_args()
     stop_at = time.time() + args.minutes * 60 if args.minutes else None
 
@@ -310,6 +411,7 @@ def main():
         f"max fill {MAX_FILL} | book must be <= {MAX_BOOK_AGE}s old | taker fee {bt.FEE_RATE} x p x (1-p) per share")
     clock.sync()
     bot = PaperBot()
+    start_web(bot, args.port or os.environ.get("PORT"))
     try:
         while stop_at is None or time.time() < stop_at:
             clock.sync()

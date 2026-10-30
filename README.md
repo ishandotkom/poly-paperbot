@@ -8,6 +8,7 @@ The paper bot only reads public data. **It never places a real order.**
 | File | What it does |
 |---|---|
 | `paper_bot.py` | Live paper trading. When BTC moves 0.03% from a window's open on Binance within the first 2 minutes, it prices a $20 market buy of that side from the live Polymarket order book (at the signal and 1–3 s later), then records the result when the market resolves. |
+| `dashboard.html` | The dashboard `paper_bot.py` serves: summary stats, a cumulative PnL chart, and every signal. |
 | `backtest_approx.py` | Backtest on 1-minute data. Also holds the shared helpers `paper_bot.py` imports (market lookup, fee formula, trade size), so keep it in the same folder. |
 | `lag_test.py` | Backtest of the same lag rule on per-second data (Polymarket trades + Binance 1-second candles). |
 
@@ -26,6 +27,7 @@ pip install -r requirements.txt
 ```bash
 python paper_bot.py               # runs until Ctrl+C
 python paper_bot.py --minutes 60  # stops after an hour, then waits for pending results
+python paper_bot.py --port 8000   # also serves the dashboard at http://localhost:8000
 ```
 
 Every signal is appended to `paper_trades.csv` once its market resolves: the BTC move, the side, the order-book
@@ -39,6 +41,24 @@ works better than a home connection.
 
 Settings (threshold, max fill price, trade size, allowed book age) are at the top of `paper_bot.py`;
 trade size is `SIZE_USD` in `backtest_approx.py`.
+
+## Run it on Render (free plan)
+
+Create a **Web Service** from this repo:
+
+- Build command: `pip install -r requirements.txt`
+- Start command: `python paper_bot.py`
+- Region: Singapore worked well (Binance feed lag ~0.05 s, order book age ~0.1 s).
+
+Render sets `PORT`, so the bot serves the dashboard at the service URL (stats, PnL chart, every signal;
+refreshes every 30 s) and the results file at `/csv`. A free instance loses its files on every restart or deploy, so download `/csv` from
+time to time, and always before pushing a change.
+
+A free instance sleeps after 15 minutes without traffic, which would stop the bot. To prevent that, the bot
+requests its own URL (`RENDER_EXTERNAL_URL`) every 10 minutes. If it still goes to sleep, set up a free
+uptime monitor to open the URL every 5–10 minutes.
+
+`Clock sync failed` in the log can be ignored on a server: the server's own clock is accurate.
 
 ## Run the backtests
 
