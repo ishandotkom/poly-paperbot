@@ -1,0 +1,13 @@
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Downloaded data (rebuilt automatically on the next run)
+cache_seconds/
+cache_*.json
+*.tmp
+
+# Generated results
+*.csv

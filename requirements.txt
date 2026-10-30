@@ -1,0 +1,4 @@
+requests>=2.31
+websocket-client>=1.6
+pandas>=2.0
+numpy>=1.24
