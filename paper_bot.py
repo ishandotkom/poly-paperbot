@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
 Paper-trading bot for the Polymarket BTC 5-minute lag idea. It never sends a real order.
-Watches Binance BTCUSDT 1-second candles and the Polymarket order book live. In the first
-ENTRY_END seconds of each window, the first time a candle closes MOVE_THRESHOLD away from the
-window's open, it works out what a SIZE_USD market buy of that side would have filled at from the
-live order book (at the signal and DELAYS seconds later), then logs the result once the market
-resolves. Signals use the same rule as lag_test.py.
+Watches Binance BTCUSDT and the Polymarket order book live. In the first ENTRY_END seconds of each
+window, the first time BTC is MOVE_THRESHOLD away from the window's open, it works out what a
+SIZE_USD market buy of that side would have filled at from the live order book (at the signal and
+DELAYS seconds later), then logs the result once the market resolves.
+Two signal modes run side by side on the same windows, each with its own results file:
+  candle    a 1-second candle closes beyond the threshold (the same rule as lag_test.py)
+  realtime  the first trade beyond the threshold, up to about a second sooner
 Run: python paper_bot.py               (runs until Ctrl+C)
      python paper_bot.py --minutes 60  (stops after an hour, then waits for pending results)
      python paper_bot.py --port 8000   (also serves the dashboard at http://localhost:8000)
-Results append to paper_trades.csv. On Render the dashboard is served on $PORT automatically.
+Results append to the LOG_FILES. On Render the dashboard is served on $PORT automatically.
 """
 
 import argparse
@@ -33,11 +35,13 @@ MAX_FILL       = 0.70           # paper-buy only if the average fill is at or be
 SIZE_USD       = bt.SIZE_USD    # dollars per paper trade
 DELAYS         = [0, 1, 2, 3]   # also price the same order this many seconds after the signal
 MAX_BOOK_AGE   = 2              # seconds; order-book data older than this (by exchange time) is not counted
-LOG_FILE       = "paper_trades.csv"
+LOG_FILES      = {"candle": "paper_trades.csv",              # signal when a 1-second candle closes beyond the threshold
+                  "realtime": "paper_trades_realtime.csv"}  # signal on the first trade beyond it
 KEEP_ALIVE_MIN = 10             # on Render, ping our own public URL this often so a free instance doesn't sleep
 
-BINANCE_WS     = "wss://stream.binance.com:9443/ws/btcusdt@kline_1s"
+BINANCE_WS     = "wss://stream.binance.com:9443/stream?streams=btcusdt@kline_1s/btcusdt@aggTrade"
 POLY_WS        = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+GIST_API       = "https://api.github.com/gists"
 
 # ================== HELPERS ==================
 def log(msg):
@@ -71,25 +75,96 @@ def sleep_until(t):
     while (left := t - clock.now()) > 0:
         time.sleep(min(left, 1))
 
+class GistStore:
+    """Keeps the results files in a secret GitHub Gist, because a free Render instance loses its files on
+    every restart or deploy. Turned on by the env vars GITHUB_TOKEN (a token with the gist scope) and GIST_ID."""
+    def __init__(self):
+        self.gist_id = os.environ.get("GIST_ID")
+        token = os.environ.get("GITHUB_TOKEN")
+        self.enabled = bool(self.gist_id and token)
+        self.headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+        self.lock = threading.Lock()
+
+    def restore(self, paths):
+        """Downloads each results file that is missing locally. If the Gist can't be read, saving is turned
+        off for this run, so a fresh empty file never overwrites the results saved there."""
+        if not self.enabled:
+            log("Gist sync off (set GITHUB_TOKEN and GIST_ID to keep results across restarts)")
+            return
+        for attempt in range(5):
+            try:
+                r = requests.get(f"{GIST_API}/{self.gist_id}", headers=self.headers, timeout=30)
+                r.raise_for_status()
+                files, texts = r.json()["files"], {}
+                for path in paths:
+                    f = files.get(path)
+                    if f and not os.path.exists(path):
+                        # the API cuts file contents off at 1 MB; raw_url has the whole file
+                        texts[path] = requests.get(f["raw_url"], timeout=60).text if f["truncated"] else f["content"]
+                break
+            except Exception as e:
+                log(f"Gist read failed ({e}), retrying in 10s")
+                time.sleep(10)
+        else:
+            self.enabled = False
+            log("Gist unreachable: NOT saving results to it this run, so the copy there stays intact")
+            return
+        for path, text in texts.items():
+            with open(path, "w", newline="") as fh:
+                fh.write(text)
+            log(f"Restored {path} from the Gist ({len(text.splitlines()) - 1} signals)")
+
+    def save(self, paths, file_lock):
+        """Uploads the whole results files. A failed upload is simply retried with the next result."""
+        if not self.enabled:
+            return
+        with self.lock:
+            with file_lock:
+                files = {}
+                for path in paths:
+                    if os.path.exists(path):
+                        with open(path, newline="") as fh:
+                            files[path] = {"content": fh.read()}
+            try:
+                requests.patch(f"{GIST_API}/{self.gist_id}", headers=self.headers, json={"files": files},
+                               timeout=60).raise_for_status()
+            except Exception as e:
+                log(f"Gist save failed ({e}), will retry after the next result")
+
+store = GistStore()
+
 # ================== FEEDS ==================
 class BinanceFeed:
-    """Keeps the BTCUSDT 1-second candle stream open; calls on_candle(open_ts, open, close) per closed candle."""
-    def __init__(self, on_candle):
-        self.on_candle = on_candle
-        self.last_lag = None    # seconds between a candle closing and us receiving it
+    """One Binance connection with two BTCUSDT streams: calls on_candle(open_ts, open, close) per closed
+    1-second candle, and on_trade(trade_ts, price) for every trade as it happens."""
+    def __init__(self, on_candle, on_trade):
+        self.on_candle, self.on_trade = on_candle, on_trade
+        self.last_lag = None          # seconds between a candle closing and us receiving it
+        self.last_trade_lag = None    # seconds between a trade and us receiving it
+        self.connected_since = None   # when the current connection opened (None while disconnected)
         threading.Thread(target=self._run, daemon=True).start()
 
     def _run(self):
         while True:
-            ws = websocket.WebSocketApp(BINANCE_WS, on_message=self._on_message,
+            ws = websocket.WebSocketApp(BINANCE_WS, on_open=self._on_open, on_message=self._on_message,
                                         on_error=lambda w, e: log(f"Binance feed error: {e}"))
             ws.run_forever(ping_interval=20, ping_timeout=10)
+            self.connected_since = None
             log("Binance feed disconnected, reconnecting in 2s")
             time.sleep(2)
 
+    def _on_open(self, ws):
+        self.connected_since = clock.now()
+
     def _on_message(self, ws, msg):
-        k = json.loads(msg)["k"]
-        if k["x"]:
+        m = json.loads(msg)
+        d = m["data"]
+        if m["stream"].endswith("@aggTrade"):
+            t = d["T"] / 1000
+            self.last_trade_lag = clock.now() - t
+            self.on_trade(t, float(d["p"]))
+        elif d["k"]["x"]:
+            k = d["k"]
             t = k["t"] / 1000
             self.last_lag = clock.now() - (t + 1)
             self.on_candle(t, float(k["o"]), float(k["c"]))
@@ -186,7 +261,9 @@ class Window:
         self.slug = market["slug"]
         self.start = market["start_ts"]
         self.open = None      # BTC price at the window start; False if that candle was missed
-        self.signal = None
+        self.rt_open = None   # the same from the trade stream (the window's first trade); False if missed
+        self.trades_before_open = False
+        self.signals = {}     # mode -> signal
         self.book = PolyBook(market["up_token"])
 
 class PaperBot:
@@ -194,14 +271,16 @@ class PaperBot:
         self.window = None
         self.csv_lock = threading.Lock()
         self.resolvers = []
-        self.results = []
-        self.pending = {}     # slug -> signal still waiting for its market to resolve
+        self.results = {mode: [] for mode in LOG_FILES}
+        self.pending = {mode: {} for mode in LOG_FILES}   # mode -> slug -> signal still waiting for its market to resolve
         self.started = time.time()
-        if os.path.exists(LOG_FILE):
-            with open(LOG_FILE, newline="") as f:
-                self.results = list(csv.DictReader(f))
-            log(f"Loaded {len(self.results)} earlier signals from {LOG_FILE}")
-        self.feed = BinanceFeed(self.on_candle)
+        store.restore(LOG_FILES.values())
+        for mode, path in LOG_FILES.items():
+            if os.path.exists(path):
+                with open(path, newline="") as f:
+                    self.results[mode] = list(csv.DictReader(f))
+                log(f"Loaded {len(self.results[mode])} earlier {mode} signals from {path}")
+        self.feed = BinanceFeed(self.on_candle, self.on_trade)
 
     def on_candle(self, t, o, c):
         w = self.window
@@ -215,18 +294,41 @@ class PaperBot:
                 w.open = False
                 log(f"{w.slug}: missed the first BTC candle of the window, skipping")
                 return
-        if w.open is False or w.signal is not None or t >= w.start + ENTRY_END:
+        if w.open is False or "candle" in w.signals or t >= w.start + ENTRY_END:
             return
         move = c / w.open - 1
         if abs(move) >= MOVE_THRESHOLD:
-            self.on_signal(w, c, t + 1, move)
+            self.on_signal(w, "candle", c, t + 1, move)
 
-    def on_signal(self, w, price, ts, move):
+    def on_trade(self, t, price):
+        w = self.window
+        if w is None:
+            return
+        if t < w.start:
+            w.trades_before_open = True
+            return
+        if w.rt_open is None:
+            # the window's first trade is its open, provided the stream was already running before the window began
+            if w.trades_before_open and self.feed.connected_since < w.start:
+                w.rt_open = price
+            else:
+                w.rt_open = False
+                log(f"{w.slug}: missed the first BTC trade of the window, no realtime signal")
+        if w.rt_open is False or "realtime" in w.signals or t >= w.start + ENTRY_END:
+            return
+        move = price / w.rt_open - 1
+        if abs(move) >= MOVE_THRESHOLD:
+            self.on_signal(w, "realtime", price, t, move)
+
+    def on_signal(self, w, mode, price, ts, move):
         side = "Up" if move > 0 else "Down"
-        sig = {"slug": w.slug, "signal_utc": utc(ts), "sec_into_window": round(ts - w.start),
-               "btc_open": w.open, "btc_price": price, "move_pct": round(move * 100, 4), "side": side,
-               "btc_feed_lag": rnd(self.feed.last_lag, 2), "fills": {}}
-        w.signal = sig
+        candle = mode == "candle"
+        sig = {"mode": mode, "slug": w.slug, "signal_utc": utc(ts),
+               "sec_into_window": round(ts - w.start) if candle else round(ts - w.start, 2),
+               "btc_open": w.open if candle else w.rt_open, "btc_price": price, "move_pct": round(move * 100, 4),
+               "side": side, "btc_feed_lag": rnd(self.feed.last_lag if candle else self.feed.last_trade_lag, 2),
+               "fills": {}}
+        w.signals[mode] = sig
 
         def snap(d):
             sig["fills"][d] = w.book.market_buy(side, SIZE_USD)
@@ -249,10 +351,10 @@ class PaperBot:
             sig["status"] = "paper buy"
         fills = " ".join(f"+{d}s {sig['fills'][d]['avg']:.3f}" for d in DELAYS if sig["fills"][d]["avg"])
         age = f"{f0['age']:.1f}s" if f0["age"] is not None else "none"
-        log(f"{w.slug}: BTC {sig['move_pct']:+.3f}% at +{sig['sec_into_window']}s -> {sig['side']} | "
+        log(f"{w.slug} {sig['mode']}: BTC {sig['move_pct']:+.3f}% at +{sig['sec_into_window']}s -> {sig['side']} | "
             f"bid/ask {f0['best_bid']}/{f0['best_ask']} (book age {age}) | avg fill {fills} | {sig['status'].upper()}")
         with self.csv_lock:
-            self.pending[w.slug] = sig
+            self.pending[sig["mode"]][w.slug] = sig
 
     def resolve_later(self, w):
         def run():
@@ -266,43 +368,46 @@ class PaperBot:
                 time.sleep(30)
             log(f"{w.slug}: no result after 30 min, not recorded")
             with self.csv_lock:
-                self.pending.pop(w.slug, None)
+                for pending in self.pending.values():
+                    pending.pop(w.slug, None)
         t = threading.Thread(target=run, daemon=True)
         t.start()
         self.resolvers.append(t)
 
     def record(self, w, winner):
-        sig = w.signal
-        won = sig["side"] == winner
-        f0 = sig["fills"][0]
-        row = {k: sig[k] for k in ("slug", "signal_utc", "sec_into_window", "btc_open", "btc_price",
-                                   "move_pct", "side", "btc_feed_lag", "status")}
-        row.update({"book_age": rnd(f0["age"], 2), "best_bid": f0["best_bid"], "best_ask": f0["best_ask"],
-                    "winner": winner, "won": won})
-        for d in DELAYS:
-            f = sig["fills"][d]
-            row[f"fill_{d}s"] = rnd(f["avg"], 4)
-            row[f"pnl_{d}s"] = rnd((f["shares"] if won else 0.0) - f["spent"] - f["fee"], 2) if tradable(f) else ""
-        with self.csv_lock:
-            new = not os.path.exists(LOG_FILE)
-            with open(LOG_FILE, "a", newline="") as fh:
-                wr = csv.DictWriter(fh, fieldnames=list(row))
-                if new:
-                    wr.writeheader()
-                wr.writerow(row)
-            self.results.append(row)
-            self.pending.pop(w.slug, None)
-        result = f"${row['pnl_0s']:+.2f}" if row["pnl_0s"] != "" else f"not traded ({sig['status']})"
-        log(f"{w.slug}: {winner} won, {sig['side']} {'WIN' if won else 'LOSS'} -> {result}")
-        log("TOTALS " + self.summary())
+        for mode, sig in w.signals.items():
+            won = sig["side"] == winner
+            f0 = sig["fills"][0]
+            row = {k: sig[k] for k in ("slug", "signal_utc", "sec_into_window", "btc_open", "btc_price",
+                                       "move_pct", "side", "btc_feed_lag", "status")}
+            row.update({"book_age": rnd(f0["age"], 2), "best_bid": f0["best_bid"], "best_ask": f0["best_ask"],
+                        "winner": winner, "won": won})
+            for d in DELAYS:
+                f = sig["fills"][d]
+                row[f"fill_{d}s"] = rnd(f["avg"], 4)
+                row[f"pnl_{d}s"] = rnd((f["shares"] if won else 0.0) - f["spent"] - f["fee"], 2) if tradable(f) else ""
+            with self.csv_lock:
+                new = not os.path.exists(LOG_FILES[mode])
+                with open(LOG_FILES[mode], "a", newline="") as fh:
+                    wr = csv.DictWriter(fh, fieldnames=list(row))
+                    if new:
+                        wr.writeheader()
+                    wr.writerow(row)
+                self.results[mode].append(row)
+                self.pending[mode].pop(w.slug, None)
+            result = f"${row['pnl_0s']:+.2f}" if row["pnl_0s"] != "" else f"not traded ({sig['status']})"
+            log(f"{w.slug} {mode}: {winner} won, {sig['side']} {'WIN' if won else 'LOSS'} -> {result}")
+            log(f"TOTALS {mode}: " + self.summary(mode))
+        store.save(LOG_FILES.values(), self.csv_lock)
 
-    def summary(self):
+    def summary(self, mode):
+        results = self.results[mode]
         parts = []
         for d in DELAYS:
-            pnls = [float(r[f"pnl_{d}s"]) for r in self.results if r.get(f"pnl_{d}s") not in ("", None)]
+            pnls = [float(r[f"pnl_{d}s"]) for r in results if r.get(f"pnl_{d}s") not in ("", None)]
             if d == 0:
                 wins = sum(p > 0 for p in pnls)
-                parts.append(f"{len(self.results)} signals, {len(pnls)} paper trades, "
+                parts.append(f"{len(results)} signals, {len(pnls)} paper trades, "
                              f"{(wins / len(pnls) * 100) if pnls else 0:.0f}% win, PnL {sum(pnls):+.2f}")
             else:
                 parts.append(f"+{d}s late {sum(pnls):+.2f} ({len(pnls)})")
@@ -310,41 +415,45 @@ class PaperBot:
 
     def state(self):
         """Everything the dashboard shows, as JSON-friendly values."""
-        with self.csv_lock:
-            rows = [dict(r) for r in self.results]
-            pending = list(self.pending.values())
-        trades = []
-        for r in rows:
-            t = {}
-            for k, v in r.items():
-                if k == "won":
-                    t[k] = v in (True, "True")
-                elif v in ("", None):
-                    t[k] = None
-                else:
-                    try:
-                        t[k] = float(v)
-                    except (TypeError, ValueError):
-                        t[k] = v
-            trades.append(t)
-        waiting = [{"slug": s["slug"], "signal_utc": s["signal_utc"], "sec_into_window": s["sec_into_window"],
-                    "move_pct": s["move_pct"], "side": s["side"], "status": s.get("status"),
-                    "best_bid": s["fills"][0]["best_bid"], "best_ask": s["fills"][0]["best_ask"],
-                    **{f"fill_{d}s": s["fills"][d]["avg"] if d in s["fills"] else None for d in DELAYS}}
-                   for s in pending]
+        modes = {}
+        for mode in LOG_FILES:
+            with self.csv_lock:
+                rows = [dict(r) for r in self.results[mode]]
+                pending = list(self.pending[mode].values())
+            trades = []
+            for r in rows:
+                t = {}
+                for k, v in r.items():
+                    if k == "won":
+                        t[k] = v in (True, "True")
+                    elif v in ("", None):
+                        t[k] = None
+                    else:
+                        try:
+                            t[k] = float(v)
+                        except (TypeError, ValueError):
+                            t[k] = v
+                trades.append(t)
+            waiting = [{"slug": s["slug"], "signal_utc": s["signal_utc"], "sec_into_window": s["sec_into_window"],
+                        "move_pct": s["move_pct"], "side": s["side"], "status": s.get("status"),
+                        "best_bid": s["fills"][0]["best_bid"], "best_ask": s["fills"][0]["best_ask"],
+                        **{f"fill_{d}s": s["fills"][d]["avg"] if d in s["fills"] else None for d in DELAYS}}
+                       for s in pending]
+            modes[mode] = {"trades": trades, "pending": waiting}
         w = self.window
         return {"now": clock.now(), "started": self.started, "window": w.slug if w else None,
-                "binance_lag": self.feed.last_lag,
+                "binance_lag": self.feed.last_lag, "trade_lag": self.feed.last_trade_lag,
                 "settings": {"move_pct": MOVE_THRESHOLD * 100, "entry_end": ENTRY_END, "max_fill": MAX_FILL,
                              "size_usd": SIZE_USD, "max_book_age": MAX_BOOK_AGE},
-                "trades": trades, "pending": waiting}
+                "modes": modes}
 
 # ================== WEB ==================
 def start_web(bot, port):
     """Dashboard for the bot (Render web services set $PORT; locally use --port).
     /           dashboard (dashboard.html)
     /api/state  the data behind it, as JSON
-    /csv        download paper_trades.csv (a free Render instance loses its files on restart)"""
+    /csv        download paper_trades.csv (a free Render instance loses its files on restart)
+    /csv/realtime  download paper_trades_realtime.csv"""
     if not port:
         return
     page = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.html")
@@ -352,21 +461,23 @@ def start_web(bot, port):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             path = self.path.split("?")[0]
+            csv_file = {"/csv": LOG_FILES["candle"], "/csv/realtime": LOG_FILES["realtime"]}.get(path)
             if path == "/api/state":
                 body = json.dumps(bot.state()).encode()
                 headers = {"Content-Type": "application/json", "Cache-Control": "no-store"}
-            elif path == "/csv" and os.path.exists(LOG_FILE):
-                with bot.csv_lock, open(LOG_FILE, "rb") as f:
+            elif csv_file and os.path.exists(csv_file):
+                with bot.csv_lock, open(csv_file, "rb") as f:
                     body = f.read()
                 headers = {"Content-Type": "text/csv",
-                           "Content-Disposition": f"attachment; filename={LOG_FILE}"}
+                           "Content-Disposition": f"attachment; filename={csv_file}"}
             elif path == "/" and os.path.exists(page):
                 with open(page, "rb") as f:
                     body = f.read()
                 headers = {"Content-Type": "text/html; charset=utf-8"}
             else:
-                body = (f"Paper bot running. No real orders are ever sent.\n\n{bot.summary()}\n\n"
-                        f"Results as CSV: /csv\n").encode()
+                totals = "\n".join(f"{mode}: {bot.summary(mode)}" for mode in LOG_FILES)
+                body = (f"Paper bot running. No real orders are ever sent.\n\n{totals}\n\n"
+                        f"Results as CSV: /csv (candle), /csv/realtime\n").encode()
                 headers = {"Content-Type": "text/plain; charset=utf-8"}
             self.send_response(200)
             for k, v in headers.items():
@@ -409,6 +520,7 @@ def main():
     log("Paper bot started. No real orders are ever sent. Ctrl+C to stop.")
     log(f"Signal: BTC {MOVE_THRESHOLD*100:.2f}% from open within {ENTRY_END}s | ${SIZE_USD}/trade | "
         f"max fill {MAX_FILL} | book must be <= {MAX_BOOK_AGE}s old | taker fee {bt.FEE_RATE} x p x (1-p) per share")
+    log(f"Signal modes: {', '.join(LOG_FILES)} (results in {', '.join(LOG_FILES.values())})")
     clock.sync()
     bot = PaperBot()
     start_web(bot, args.port or os.environ.get("PORT"))
@@ -432,7 +544,7 @@ def main():
             sleep_until(start + ENTRY_END + max(DELAYS) + 2)
             bot.window = None
             w.book.stop()
-            if w.signal is None:
+            if not w.signals:
                 if w.open:
                     log(f"{slug}: no signal (BTC stayed within {MOVE_THRESHOLD*100:.2f}% for {ENTRY_END}s)")
             else:
@@ -442,7 +554,8 @@ def main():
             t.join(timeout=600)
     except KeyboardInterrupt:
         log("Stopped.")
-    log("TOTALS " + bot.summary())
+    for mode in LOG_FILES:
+        log(f"TOTALS {mode}: " + bot.summary(mode))
 
 if __name__ == "__main__":
     main()

@@ -82,9 +82,21 @@ h2 { font-size: 15px; font-weight: 600; margin: 0; }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
 .live.ok .dot { background: var(--good); }
 .live.down .dot { background: var(--warning); }
-.context { color: var(--text-2); font-size: 13px; margin: 12px 0 20px; }
+.context { color: var(--text-2); font-size: 13px; margin: 12px 0 16px; }
 
-.kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 16px; }
+.mode-bar { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; margin-bottom: 16px; }
+.modes { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.modes button {
+  font: inherit; font-size: 13px; padding: 6px 14px; border: 0; cursor: pointer;
+  background: var(--surface); color: var(--text-2);
+}
+.modes button + button { border-left: 1px solid var(--border); }
+.modes button:hover { background: var(--hover); }
+.modes button[aria-pressed="true"] { background: var(--text-1); color: var(--page); }
+.modes button:focus-visible { outline: 2px solid var(--s0); outline-offset: -2px; }
+.mode-bar .note { margin: 0; }
+
+.kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin-bottom: 16px; }
 .tile, .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; }
 .tile { padding: 14px 16px; }
 .tile .label { color: var(--text-2); font-size: 13px; }
@@ -138,6 +150,14 @@ a { color: var(--s0); }
   </header>
   <p class="context" id="context"></p>
 
+  <div class="mode-bar">
+    <div class="modes" role="group" aria-label="Signal source">
+      <button type="button" data-mode="candle">Candle close</button>
+      <button type="button" data-mode="realtime">Realtime trades</button>
+    </div>
+    <p class="note" id="modeNote"></p>
+  </div>
+
   <section class="kpis" id="kpis" aria-label="Summary"></section>
 
   <section class="card">
@@ -155,7 +175,7 @@ a { color: var(--s0); }
   <section class="card">
     <div class="card-head">
       <h2>Signals</h2>
-      <a href="/csv">Download CSV</a>
+      <a href="/csv" id="csvLink">Download CSV</a>
     </div>
     <div class="table-wrap">
       <table>
@@ -180,10 +200,15 @@ const SERIES = [
   { key: "pnl_2s", name: "2 s late", color: "var(--s2)" },
   { key: "pnl_3s", name: "3 s late", color: "var(--s3)" },
 ];
+const MODES = {
+  candle: { csv: "/csv", note: "Signal when a Binance 1-second candle closes beyond the threshold (the original rule)." },
+  realtime: { csv: "/csv/realtime", note: "Signal on the first Binance trade beyond the threshold, up to about 1 s sooner. Same windows, separate results." },
+};
 const MAX_ROWS = 300;
 const SVG_NS = "http://www.w3.org/2000/svg";
 const $ = (id) => document.getElementById(id);
 
+let mode = location.hash === "#realtime" ? "realtime" : "candle";
 let state = null;
 let points = [];      // [{v: [cum per series], trade}] — index 0 is the start
 let hoverIdx = null;
@@ -233,15 +258,20 @@ function setLive(ok, text) {
 }
 
 function render() {
-  const trades = [...state.trades].sort((a, b) => String(a.signal_utc).localeCompare(String(b.signal_utc)));
+  const data = state.modes[mode];
+  const trades = [...data.trades].sort((a, b) => String(a.signal_utc).localeCompare(String(b.signal_utc)));
   const s = state.settings;
   $("sizeUsd").textContent = s.size_usd;
+  for (const b of document.querySelectorAll(".modes button")) b.setAttribute("aria-pressed", b.dataset.mode === mode);
+  $("modeNote").textContent = MODES[mode].note;
+  $("csvLink").href = MODES[mode].csv;
 
-  const lag = state.binance_lag == null ? "—" : state.binance_lag.toFixed(2) + " s";
+  const secs = (v) => v == null ? "—" : v.toFixed(2) + " s";
   const watching = state.window ? `Watching the ${clockUtc(+state.window.split("-").pop())} UTC window`
                                 : "Waiting for the next window";
   $("context").textContent =
-    `${watching} · Binance feed lag ${lag} · running ${duration(state.now - state.started)} · ` +
+    `${watching} · Binance feed lag: candles ${secs(state.binance_lag)}, trades ${secs(state.trade_lag)} · ` +
+    `running ${duration(state.now - state.started)} · ` +
     `Signal: BTC ±${s.move_pct.toFixed(2)}% from the window open within ${s.entry_end} s · ` +
     `max fill ${s.max_fill.toFixed(2)} · order book ≤ ${s.max_book_age} s old`;
 
@@ -253,7 +283,16 @@ function render() {
   }
   renderLegend();
   drawChart();
-  renderTable(trades);
+  renderTable(trades, data.pending);
+}
+
+for (const b of document.querySelectorAll(".modes button")) {
+  b.addEventListener("click", () => {
+    mode = b.dataset.mode;
+    history.replaceState(null, "", mode === "realtime" ? "#realtime" : location.pathname);
+    hoverIdx = null;
+    if (state) render();
+  });
 }
 
 function renderKpis(trades) {
@@ -275,6 +314,14 @@ function renderKpis(trades) {
     ["If 1 s late", traded.length ? money(sum("pnl_1s")) : "—", "same signals, filled 1 s later"],
     ["Skipped signals", String(skipped.length), reasonText || "none so far"],
   ];
+  if (mode === "realtime") {
+    // how much sooner than the candle signal in the same window
+    const candle = new Map(state.modes.candle.trades.map((t) => [t.slug, t]));
+    const both = trades.filter((t) => candle.has(t.slug));
+    const lead = both.reduce((a, t) => a + candle.get(t.slug).sec_into_window - t.sec_into_window, 0) / both.length;
+    tiles.push(["Sooner than candle", both.length ? lead.toFixed(2) + " s" : "—",
+      `average over ${both.length} windows with both · ${trades.length - both.length} realtime only`]);
+  }
   const box = $("kpis");
   box.replaceChildren(...tiles.map(([label, value, hint]) => {
     const tile = el("div", { class: "tile" });
@@ -449,7 +496,8 @@ function row(t, pending) {
   const fill = t.fill_0s == null ? "—" : t.fill_0s.toFixed(3);
   const bidAsk = t.best_bid == null || t.best_ask == null ? "—" : `${(+t.best_bid).toFixed(2)} / ${(+t.best_ask).toFixed(2)}`;
   const move = el("td");
-  move.append(document.createTextNode(pct(t.move_pct) + " "), el("span", { class: "dim" }, `at +${Math.round(t.sec_into_window)} s`));
+  const sec = Number.isInteger(t.sec_into_window) ? t.sec_into_window : t.sec_into_window.toFixed(1);
+  move.append(document.createTextNode(pct(t.move_pct) + " "), el("span", { class: "dim" }, `at +${sec} s`));
   tr.append(
     el("td", { class: "num", style: "text-align:left" }, String(t.signal_utc).slice(5)),
     move,
@@ -463,8 +511,8 @@ function row(t, pending) {
   );
   return tr;
 }
-function renderTable(trades) {
-  const pending = [...state.pending].sort((a, b) => String(b.signal_utc).localeCompare(String(a.signal_utc)));
+function renderTable(trades, waiting) {
+  const pending = [...waiting].sort((a, b) => String(b.signal_utc).localeCompare(String(a.signal_utc)));
   const done = [...trades].reverse();
   const rows = [...pending.map((t) => row(t, true)), ...done.slice(0, MAX_ROWS).map((t) => row(t, false))];
   $("rows").replaceChildren(...rows);
